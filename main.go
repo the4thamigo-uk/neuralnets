@@ -11,8 +11,7 @@ import (
 )
 
 const (
-	defaultWeight = 0.0
-	learningRate  = 0.1
+	learningRate = 0.1
 )
 
 type (
@@ -22,20 +21,24 @@ type (
 	}
 
 	layer struct {
-		w          *mat.Dense
+		w          mat.Matrix
+		b          mat.Vector
 		activation func(float64) float64
 	}
 
 	result struct {
 		in   mat.Vector
 		out  mat.Vector
-		sum  mat.Vector // weighted sum of inputs
 		dsig mat.Vector
 	}
 
 	learned struct {
+		w      mat.Matrix
+		b      mat.Vector
 		wSens  mat.Matrix
+		bSens  mat.Matrix
 		wShift mat.Matrix
+		del    mat.Vector
 	}
 )
 
@@ -48,36 +51,42 @@ func main() {
 }
 
 func run() error {
-	n := newNet(2, 10, 10, 1)
-
-	f := func(x, y float64) float64 {
-		return y * math.Sin(math.Pi*x)
-	}
-
-	const N = 10000000
-
 	rand.Seed(time.Now().UnixNano())
 
-	for i := 0; i < N; i++ {
-		x := 2.0*rand.Float64() - 1.0
-		y := 2.0*rand.Float64() - 1.0
+	n := newNet(2, 20, 20, 1)
+	n.init(randWeight)
+
+	f := func(x, y float64) float64 {
+		return (1.0 + math.Cos(2*math.Pi*math.Sqrt(x*x+y*y))) / 2.0
+	}
+
+	const (
+		epochs = 1000000
+		update = epochs / 100
+	)
+
+	for i := 0; i < epochs; i++ {
+		x := rand.Float64()
+		y := rand.Float64()
 		z := f(x, y)
+
 		in := mat.NewVecDense(2, []float64{x, y})
 		exp := mat.NewVecDense(1, []float64{z})
 
 		rr := n.calculate(in)
-		n.learn(rr, exp)
+		ll := n.learn(rr, exp)
+		n.adjust(ll)
 
-		if i%100000 == 0 {
-			_, cost := cost(rr[len(rr)-1].out, exp)
-			spew.Printf("train: epoch=%d, cost=%v\n", i*100.0/N, sum(cost))
-		}
+		//if i%update == 0 {
+		//	_, cost := cost(rr[len(rr)-1].out, exp)
+		//	spew.Printf("train %v%%: cost=%v\r", i*100.0/epochs, sum(cost))
+		//}
 	}
 
-	spew.Println("x\ty\tz\tact\tcost")
+	spew.Println("x\ty\tz\tact\tdiff\tcost")
 
-	for x := -1.0; x <= 1.0; x += 0.1 {
-		for y := -1.0; y <= 1.0; y += 0.1 {
+	for x := 0.0; x <= 1.0; x += 0.05 {
+		for y := 0.0; y <= 1.0; y += 0.05 {
 			z := f(x, y)
 			in := mat.NewVecDense(2, []float64{x, y})
 			exp := mat.NewVecDense(1, []float64{z})
@@ -95,17 +104,22 @@ func newNet(dims ...int) *net {
 	for i := 0; i < len(dims)-1; i++ {
 		r := dims[i+1]
 		c := dims[i]
-		w := mat.NewDense(r, c, makeSlice(r*c, defaultWeight))
-		lrs = append(lrs, &layer{w: w})
+		w := mat.NewDense(r, c, makeSlice(r*c, 0))
+		b := mat.NewVecDense(r, makeSlice(r, 0))
+		lrs = append(lrs, &layer{w: w, b: b})
 	}
 	return &net{
 		layers: lrs,
 	}
 }
 
-func (n *net) learn(rr []*result, exp mat.Vector) []*learned {
-	var lastDel mat.Matrix
+func (n *net) init(weight func() float64) {
+	for _, l := range n.layers {
+		l.init(weight)
+	}
+}
 
+func (n *net) learn(rr []*result, exp mat.Vector) []*learned {
 	out := make([]*learned, len(rr))
 
 	for i := len(rr) - 1; i >= 0; i-- {
@@ -114,13 +128,11 @@ func (n *net) learn(rr []*result, exp mat.Vector) []*learned {
 
 		var del mat.Dense
 		if i == len(rr)-1 /* output layer */ {
-
 			diff, _ := cost(r.out, exp)
 			del.MulElem(diff, r.dsig)
-
 		} else /* hidden layers */ {
 			var wdel mat.Dense
-			wdel.Mul(n.layers[i+1].w.T(), lastDel)
+			wdel.Mul(n.layers[i+1].w.T(), out[i+1].del)
 			del.MulElem(&wdel, r.dsig)
 		}
 
@@ -130,23 +142,43 @@ func (n *net) learn(rr []*result, exp mat.Vector) []*learned {
 			return del.At(i, 0) * r.in.AtVec(j)
 		}, l.w)
 
+		var bSens mat.Dense
+		bSens.Apply(func(i, j int, s float64) float64 {
+			return del.At(i, 0)
+		}, l.b)
+
 		// compute the shift of weights from the sensitivities
 		var wShift mat.Dense
 		wShift.Scale(-learningRate, &wSens)
 
+		var bShift mat.Dense
+		bShift.Scale(-learningRate, &bSens)
+
 		// shift weights in this layer
 		var w mat.Dense
 		w.Add(l.w, &wShift)
-		l.w = &w
+
+		var b mat.Dense
+		b.Add(l.b, &bShift)
 
 		out[i] = &learned{
 			wSens:  &wSens,
+			bSens:  &bSens,
 			wShift: &wShift,
+			w:      &w,
+			b:      b.ColView(0),
+			del:    del.ColView(0),
 		}
-
-		lastDel = &del
 	}
 	return out
+}
+
+func (n *net) adjust(ll []*learned) {
+	for i, lyr := range n.layers {
+		lrn := ll[i]
+		lyr.w = lrn.w
+		lyr.b = lrn.b
+	}
 }
 
 func (n *net) calculate(in mat.Vector) []*result {
@@ -160,23 +192,39 @@ func (n *net) calculate(in mat.Vector) []*result {
 }
 
 func (l *layer) calculate(in mat.Vector) *result {
-	var sum mat.Dense
-	sum.Mul(l.w, in)
+	var mul mat.Dense
+	mul.Mul(l.w, in)
 
-	var out mat.Dense
-	out.Apply(applySigmoid, &sum)
+	var sum mat.Dense
+	sum.Add(&mul, l.b)
+
+	var act mat.Dense
+	act.Apply(applySigmoid, &sum)
 
 	var dsig mat.Dense
-	dsig.Apply(func(i, j int, s float64) float64 {
+	dsig.Apply(func(_, _ int, s float64) float64 {
 		return dsigmoid(s)
 	}, &sum)
 
 	return &result{
 		in:   mat.VecDenseCopyOf(in),
-		out:  out.ColView(0),
-		sum:  sum.ColView(0),
+		out:  act.ColView(0),
 		dsig: dsig.ColView(0),
 	}
+}
+
+func (l *layer) init(weight func() float64) {
+	var w mat.Dense
+	w.Apply(func(_, _ int, _ float64) float64 {
+		return weight()
+	}, l.w)
+	l.w = &w
+
+	var b mat.Dense
+	b.Apply(func(_, _ int, _ float64) float64 {
+		return weight()
+	}, l.b)
+	l.b = b.ColView(0)
 }
 
 func cost(out, exp mat.Vector) (mat.Vector, mat.Vector) {
@@ -226,4 +274,8 @@ func sigmoid(val float64) float64 {
 func dsigmoid(val float64) float64 {
 	s := sigmoid(val)
 	return s * (1.0 - s)
+}
+
+func randWeight() float64 {
+	return rand.Float64() / 2.0
 }
